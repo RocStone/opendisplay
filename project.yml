@@ -60,23 +60,21 @@ targets:
         NSLocalNetworkUsageDescription: OpenDisplay connects to your iPad or iPhone over the local network in WiFi mode.
         NSBonjourServices: ["_opensidecar._tcp"]
         LSApplicationCategoryType: public.app-category.utilities
-        # --- Sparkle auto-update (issue #52) ---
-        # The appcast feed is hosted on the landing-page site at the custom
-        # domain. The release workflow publishes appcast.xml so this URL
-        # resolves — see .github/workflows/release.yml.
-        SUFeedURL: https://opendisplay.app/appcast.xml
-        # Public EdDSA key from Sparkle's `generate_keys`. The matching private
-        # key lives only as the `SPARKLE_PRIVATE_KEY` GitHub Actions secret
-        # (used to sign the appcast in CI) and is never committed. Sparkle
-        # verifies update signatures against this public key before installing.
+        # --- Sparkle auto-update: off in this fork ---
+        # Upstream's feed (opendisplay.app/appcast.xml) would replace this
+        # build with the official one. The sender never starts its updater
+        # (AppDelegate), and no feed URL is set, so nothing can check.
         SUPublicEDKey: rYxlIePmwzi2bRo/qIsuY2TqTnQ34li2gQhJpGBiumw=
-        # Check for updates automatically in the background on a schedule.
-        SUEnableAutomaticChecks: true
+        SUEnableAutomaticChecks: false
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.peetzweg.opensidecar.mac
         PRODUCT_NAME: OpenDisplay
         BUNDLE_DISPLAY_NAME: OpenDisplay
+        # The fork's version: the upstream release it is based on plus a
+        # fork suffix. The build number sits above upstream 1.25.0's (178).
+        MARKETING_VERSION: "1.25.0-roc.1"
+        CURRENT_PROJECT_VERSION: "179"
         SWIFT_OBJC_BRIDGING_HEADER: Mac/OpenSidecarMac-Bridging-Header.h
         ENABLE_HARDENED_RUNTIME: YES
         CODE_SIGN_ENTITLEMENTS: Mac/OpenSidecarMac.entitlements
@@ -153,6 +151,7 @@ targets:
       - MacTests
       - Mac/DisplayArrangement.swift
       - Mac/StreamConfiguration.swift
+      - Mac/ConnectionMethod.swift
       - Mac/VirtualCanvasSizing.swift
       - Mac/PhoneInfo.swift
       - Mac/DesktopPolicy.swift

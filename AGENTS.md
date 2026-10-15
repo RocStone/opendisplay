@@ -20,3 +20,26 @@ Debug receiver to `~/Applications/OpenDisplay Receiver Dev.app`; do not replace
 the release receiver app. A windowed receiver is sufficient for protocol,
 encode, and decode validation. Use its fullscreen video window for end-to-end
 latency, presentation, scaling, and visual-quality measurements.
+
+# Fork release build
+
+This fork ships the sender without Sparkle: upstream's appcast would replace
+it with the official build. The Release sender keeps the release bundle ID,
+so it inherits the official app's settings (UserDefaults), but it is signed
+by a different identity, so Screen Recording, Accessibility and Local Network
+must be granted again after it replaces the official app. Build it with a
+real identity (no provisioning profile is needed):
+
+    xcodebuild build -project OpenSidecar.xcodeproj -scheme OpenSidecarMac \
+      -configuration Release -derivedDataPath build \
+      DEVELOPMENT_TEAM=<team id> CODE_SIGN_STYLE=Manual \
+      CODE_SIGN_IDENTITY="Apple Development: <name> (<id>)"
+
+Never launch it next to a running official sender: same bundle ID, same
+settings, and both would dial the same receivers.
+
+The Connection setting (Automatic / Cable / WiFi, `Mac/ConnectionMethod.swift`)
+pins a Bonjour dial to one local interface with
+`.service(name:type:domain:interface:)` plus `requiredInterface`. That
+resolves at once; a dial that only prohibits WiFi can wander onto a VPN's
+utun interface and hang.
