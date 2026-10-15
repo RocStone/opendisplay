@@ -239,6 +239,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     // is already as good as a probe could find — re-probing there would
     // migrate in a circle.
     private var currentPathUsesWiFi = false
+    // Off when the user pinned the connection method (Cable or WiFi): the
+    // probe would move a WiFi-only session onto the cable.
+    private var cableUpgradeAllowed: Bool
     // Set while the live session rides the direct cable link (USB-C /
     // Thunderbolt host-to-host to a Mac receiver, link-local addressed).
     // Losing that link is treated as intent — see linkDied(). A merely-
@@ -350,8 +353,10 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
 
     init(transport: SenderTransport, name: String, mode: CaptureMode,
          quality: StreamQuality = .best, displaySerial: UInt32 = 0x0001,
-         identityOffset: UInt32 = 0, awaitingWake: Bool = false) {
+         identityOffset: UInt32 = 0, awaitingWake: Bool = false,
+         cableUpgradeAllowed: Bool = true) {
         self.transport = transport
+        self.cableUpgradeAllowed = cableUpgradeAllowed
         self.endpointName = name
         self.mode = mode
         self.quality = quality
@@ -1295,6 +1300,19 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         }
     }
 
+    /// The connection method changed: arm or disarm the cable upgrade.
+    func setCableUpgradeAllowed(_ allowed: Bool) {
+        queue.async { [weak self] in
+            guard let self, self.cableUpgradeAllowed != allowed else { return }
+            self.cableUpgradeAllowed = allowed
+            if !allowed {
+                self.stopUpgradeProbing()
+            } else if self.connectionReady, self.currentPathUsesWiFi {
+                self.startUpgradeProbing()
+            }
+        }
+    }
+
     // The controller's end() is idempotent, but several detectors (grace,
     // refusals, service withdrawal) can conclude "gone" repeatedly while the
     // stop is in flight — report once so the log tells the story once.
@@ -1584,7 +1602,8 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         }
         // -forceUpgradeProbe YES: dev knob — loopback runs never look like
         // WiFi, so this is the only way to exercise probe+migrate on one Mac.
-        if currentPathUsesWiFi || UserDefaults.standard.bool(forKey: "forceUpgradeProbe") {
+        if cableUpgradeAllowed,
+           currentPathUsesWiFi || UserDefaults.standard.bool(forKey: "forceUpgradeProbe") {
             startUpgradeProbing()
         } else {
             stopUpgradeProbing()   // already off WiFi — nothing better to find
@@ -1634,7 +1653,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     /// interface for link-local IPv6) with WiFi forbidden. mDNS resolution
     /// stalls under interface restrictions; literal addresses do not.
     private func probeForCablePath(force: Bool = false) {
-        guard !stopped, connectionReady,
+        guard !stopped, connectionReady, cableUpgradeAllowed,
               currentPathUsesWiFi || UserDefaults.standard.bool(forKey: "forceUpgradeProbe"),
               case .tcp = transport, !peerAddrs.isEmpty else { return }
         if force {
@@ -1790,12 +1809,20 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     private func connectTCP(_ endpoint: NWEndpoint) {
         let options = NWProtocolTCP.Options()
         options.noDelay = true   // latency matters more than throughput here
-        // No interface steering: macOS already ranks a Thunderbolt Bridge or
-        // Ethernet link above WiFi, so a plain dial lands on the cable when
-        // there is one (field-tested: en10 chosen over en0). A WiFi-prohibited
+        // No interface steering by default: macOS usually ranks a Thunderbolt
+        // Bridge or Ethernet link above WiFi, so a plain dial tends to land
+        // on the cable (field-tested: en10 chosen over en0), though a
+        // link-local-only USB-C link has also lost that race. A WiFi-prohibited
         // pre-dial was tried and only ever hung until its timeout, adding 2s
         // to every connect. becomeReady reports which path won.
         let params = NWParameters(tls: nil, tcp: options)
+        // The exception is a service endpoint scoped to one interface (the
+        // Cable / WiFi connection methods): resolving and connecting on that
+        // interface alone answers at once, unlike a type-prohibited dial,
+        // which wanders onto a VPN tunnel and hangs.
+        if case .service(_, _, _, let interface?) = endpoint {
+            params.requiredInterface = interface
+        }
         let conn = NWConnection(to: endpoint, using: params)
         connection = conn
         // A dial to a withdrawn Bonjour service (receiver asleep or app

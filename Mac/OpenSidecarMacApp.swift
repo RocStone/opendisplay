@@ -37,13 +37,9 @@ struct OpenSidecarMacApp: App {
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    // Sparkle's standard updater. `startingUpdater: true` boots the updater
-    // immediately so scheduled background checks (SUEnableAutomaticChecks)
-    // run; the menu item drives manual "Check for Updates…". Held for the
-    // app's lifetime here so every window (menu bar + control window) shares
-    // one updater instance.
-    let updater = SPUStandardUpdaterController(
-        startingUpdater: true, updaterDelegate: nil, userDriverDelegate: nil)
+    // No updater in this fork: upstream's Sparkle feed would replace this
+    // build with the official one. Nil also hides "Check for Updates…".
+    let updater: SPUStandardUpdaterController? = nil
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Hand the updater to the control window, which is built outside the
@@ -147,6 +143,9 @@ final class DeviceSession: ObservableObject, Identifiable {
     // after a failover — the name is then the only link between the session
     // and its service row.
     var wifiServiceName: String?
+    // The local interface the TCP dial is pinned to (Cable / WiFi connection
+    // methods); nil while the dial may take any path.
+    var pinnedInterface: String?
 
     // The live TCP path runs over a cable (Thunderbolt Bridge / Ethernet)
     // rather than WiFi — reported by the sender once connected.
@@ -220,6 +219,9 @@ final class SenderController: ObservableObject {
     @Published var mode = CaptureMode(rawValue: UserDefaults.standard.string(forKey: "mode") ?? "") ?? .extend
     @Published var quality = StreamQuality(rawValue: UserDefaults.standard.string(forKey: "quality") ?? "") ?? .best {
         didSet { UserDefaults.standard.set(quality.rawValue, forKey: "quality") }
+    }
+    @Published var connectionMethod = ConnectionMethod.load() {
+        didSet { UserDefaults.standard.set(connectionMethod.rawValue, forKey: ConnectionMethod.defaultsKey) }
     }
 
     var running: Bool { !sessions.isEmpty }
@@ -337,6 +339,16 @@ final class SenderController: ObservableObject {
         return false
     }
 
+    /// The WiFi service of a USB device, attached or not (by the install id
+    /// its hello once announced).
+    private func wifiTwin(ofUDID udid: String) -> NWBrowser.Result? {
+        if let device = usbDevices.first(where: { $0.udid == udid }) {
+            return discovered.first { sameDevice($0, device) }
+        }
+        guard let installID = installIDByUDID[udid] else { return nil }
+        return discovered.first { txtID(of: $0) == installID }
+    }
+
     /// The session (over either transport) already serving this USB device.
     /// A failed session serves nothing — it must not block auto-connecting
     /// the same physical device over the other transport.
@@ -381,7 +393,7 @@ final class SenderController: ObservableObject {
            !usbDisabled.contains("usb:first"), session(for: "usb:first") == nil {
             connect(to: .usb(udid: nil))
         }
-        for device in usbDevices {
+        for device in usbDevices where connectionMethod.allowsUSB {
             if let covering = activeSession(coveringUSB: device) {
                 // usbDisabled gates auto-connecting a device, not the
                 // transport of a session the user deliberately has running —
@@ -396,7 +408,7 @@ final class SenderController: ObservableObject {
             let target = ConnectionTarget.wifi(result)
             if wifiRemembered.contains(target.sessionID),
                activeSession(coveringWiFi: result) == nil,
-               !cabled(result) {
+               !cabled(result), route(for: result) != .unavailable {
                 connect(to: target)
             }
         }
@@ -405,7 +417,7 @@ final class SenderController: ObservableObject {
     /// An attached, auto-connectable USB device is (about to be) dialed over
     /// the cable — its WiFi service must not be grabbed in the launch race.
     private func cabled(_ result: NWBrowser.Result) -> Bool {
-        usbDevices.contains {
+        connectionMethod.allowsUSB && usbDevices.contains {
             sameDevice(result, $0) && !usbDisabled.contains("usb:\($0.udid)")
         }
     }
@@ -420,6 +432,7 @@ final class SenderController: ObservableObject {
         let plugged = nowOnCable.subtracting(onDirectCable)
         onDirectCable = nowOnCable
         everOnCable.formUnion(nowOnCable)
+        guard connectionMethod.connectsOnCablePlug else { return }
         guard autoConnectEnabled, !plugged.isEmpty else { return }
         for result in discovered {
             guard let name = serviceName(of: result), plugged.contains(name),
@@ -448,6 +461,93 @@ final class SenderController: ObservableObject {
         }
     }
 
+    // MARK: - Connection method (Automatic / Cable / WiFi)
+
+    /// How the current connection method dials this service.
+    func route(for result: NWBrowser.Result) -> ServiceRoute {
+        connectionMethod.route(among: result.interfaces.map(RouteInterface.init))
+    }
+
+    private func pinnedInterface(for result: NWBrowser.Result) -> String? {
+        if case .pinned(let name) = route(for: result) { return name }
+        return nil
+    }
+
+    /// The endpoint to dial for a discovered service: the service itself
+    /// (Automatic), the service scoped to the one interface the method
+    /// allows, or nil when it allows none.
+    private func endpoint(for result: NWBrowser.Result) -> NWEndpoint? {
+        switch route(for: result) {
+        case .anyPath:
+            return result.endpoint
+        case .pinned(let name):
+            guard let interface = result.interfaces.first(where: { $0.name == name }),
+                  case .service(let service, let type, let domain, _) = result.endpoint
+            else { return nil }
+            return .service(name: service, type: type, domain: domain, interface: interface)
+        case .unavailable:
+            return nil
+        }
+    }
+
+    /// The user picked another connection method: move every live session
+    /// onto a path it allows (a socket swap, the display stays up), and end
+    /// the ones it leaves no path for. Automatic leaves sessions where they
+    /// are and re-arms the upgrade and the USB takeover.
+    func applyConnectionMethod() {
+        Log.info("connection method: \(connectionMethod.label)")
+        for session in sessions where !session.failed {
+            session.sender.setCableUpgradeAllowed(connectionMethod.switchesPathsOnItsOwn)
+            guard connectionMethod != .automatic else {
+                // The upgrade may now move the session off its pinned
+                // interface, so the pin no longer says where it is.
+                session.pinnedInterface = nil
+                continue
+            }
+            if session.onUSB, connectionMethod.allowsUSB { continue }
+            // The dev -host override has no Bonjour service to move onto.
+            if case .usb(nil) = session.target { continue }
+            guard let result = wifiService(for: session),
+                  let endpoint = endpoint(for: result) else {
+                Log.info("\(session.id): no \(connectionMethod.label) path — ending the session")
+                end(session)
+                continue
+            }
+            let pinned = pinnedInterface(for: result)
+            guard session.onUSB || pinned != session.pinnedInterface else { continue }
+            Log.info("\(session.id): moving onto \(pinned ?? "any path") for \(connectionMethod.label)")
+            session.onUSB = false
+            session.wifiServiceName = serviceName(of: result)
+            session.pinnedInterface = pinned
+            session.sender.switchTransport(to: .tcp(endpoint))
+        }
+        autoConnect()
+    }
+
+    /// The transports under a device row's name: what Connect would use, or
+    /// why the connection method leaves it nothing.
+    func caption(for entry: DeviceEntry) -> String {
+        guard !entry.transportLabel.isEmpty else { return "" }
+        guard connectTarget(for: entry) != nil else {
+            return "\(entry.transportLabel) · \(connectionMethod.unavailableNote)"
+        }
+        // Cable with no usbmux device: the service is pinned to the cable.
+        if connectionMethod == .cable, entry.usbTarget == nil { return "Cable" }
+        return entry.transportLabel
+    }
+
+    /// The target a device row's Connect dials, nil when the connection
+    /// method rules out all of them.
+    func connectTarget(for entry: DeviceEntry) -> ConnectionTarget? {
+        let network = entry.wifiTarget.flatMap { target -> (target: ConnectionTarget, route: ServiceRoute)? in
+            guard case .wifi(let result) = target else { return nil }
+            return (target, route(for: result))
+        }
+        // The dev -host override rides the USB slot but is plain TCP.
+        if case .usb(nil)? = entry.usbTarget { return entry.usbTarget }
+        return connectionMethod.pick(usb: entry.usbTarget, network: network)
+    }
+
     /// Cable plugged in while the device streams over WiFi: migrate the live
     /// session onto USB. No-op when the session is already cabled.
     private func upgradeToUSB(_ session: DeviceSession, device: UsbmuxDevice) {
@@ -455,6 +555,7 @@ final class SenderController: ObservableObject {
         Log.info("cable attached for \(session.id) — migrating to USB")
         session.onUSB = true
         session.usbUDID = device.udid
+        session.pinnedInterface = nil
         // The match may have been by name only — pin the strong identity so
         // future matching (and the next launch) recognizes the pair.
         if let id = session.deviceID { installIDByUDID[device.udid] = id }
@@ -465,7 +566,8 @@ final class SenderController: ObservableObject {
     /// service if one is visible. Without one the session keeps its normal
     /// fate — retry over USB through the grace period, then end.
     private func failover(detachedUDIDs: Set<String>) {
-        guard autoConnectEnabled, !detachedUDIDs.isEmpty else { return }
+        guard autoConnectEnabled, connectionMethod.switchesPathsOnItsOwn,
+              !detachedUDIDs.isEmpty else { return }
         for session in sessions where session.onUSB {
             guard let udid = session.usbUDID, detachedUDIDs.contains(udid),
                   let result = wifiService(for: session) else { continue }
@@ -572,12 +674,44 @@ final class SenderController: ObservableObject {
 
     func connect(to target: ConnectionTarget, userInitiated: Bool = false,
                  awaitingWake: Bool = false) {
+        // A stored target (wake, Retry, Mode change) carries the interfaces
+        // its record was seen on back then; the route needs today's.
+        var target = target
+        if case .wifi(let stale) = target, let name = serviceName(of: stale),
+           let fresh = discovered.first(where: { serviceName(of: $0) == name }) {
+            target = .wifi(fresh)
+        }
         let id = target.sessionID
         if let existing = session(for: id) {
             // A failed session holds no pipeline — replace the corpse
             // instead of letting it swallow the fresh attempt.
             guard existing.failed else { return }
             end(existing)
+        }
+
+        // Cable / WiFi: never dial a path the user ruled out (the device row
+        // says why it offers no Connect). A session's target is where it
+        // started, so a reconnect (wake, Retry, Mode change) may name a
+        // ruled-out path: take the device's other one when there is one.
+        switch target {
+        case .usb(let udid?) where !connectionMethod.allowsUSB:
+            if let twin = wifiTwin(ofUDID: udid), route(for: twin) != .unavailable {
+                connect(to: .wifi(twin), userInitiated: userInitiated, awaitingWake: awaitingWake)
+            } else {
+                Log.info("\(id): connection set to \(connectionMethod.label) and no WiFi service — not connecting")
+            }
+            return
+        case .wifi(let result) where route(for: result) == .unavailable:
+            if connectionMethod.allowsUSB,
+               let device = usbDevices.first(where: { sameDevice(result, $0) }) {
+                connect(to: .usb(udid: device.udid), userInitiated: userInitiated,
+                        awaitingWake: awaitingWake)
+            } else {
+                Log.info("\(id): connection set to \(connectionMethod.label) and no such path — not connecting")
+            }
+            return
+        default:
+            break
         }
 
         // Never create a second session for the same physical device — the
@@ -621,17 +755,20 @@ final class SenderController: ObservableObject {
                 transport = .usb(udid: udid, port: portNum)
             }
         case .wifi(let result):
-            transport = .tcp(result.endpoint)
+            guard let endpoint = endpoint(for: result) else { return }
+            transport = .tcp(endpoint)
         }
 
         let name = label(for: target)
         let sender = MacSender(transport: transport, name: name, mode: mode,
                                quality: quality, displaySerial: Self.displaySerial(for: id),
                                identityOffset: identityOffset(for: id),
-                               awaitingWake: awaitingWake)
+                               awaitingWake: awaitingWake,
+                               cableUpgradeAllowed: connectionMethod.switchesPathsOnItsOwn)
         let session = DeviceSession(id: id, target: target, name: name, sender: sender)
         if case .wifi(let result) = target {
             session.wifiServiceName = serviceName(of: result)
+            session.pinnedInterface = pinnedInterface(for: result)
         }
         sender.onStatus = { [weak session] text in
             // Retry loops re-announce the same status every second (e.g. the
@@ -789,8 +926,6 @@ final class SenderController: ObservableObject {
             default: return ""
             }
         }
-        /// Lowest latency first.
-        var preferredTarget: ConnectionTarget? { usbTarget ?? wifiTarget }
     }
 
     var deviceEntries: [DeviceEntry] {
@@ -958,14 +1093,15 @@ struct ContentView: View {
                                 Circle()
                                     .fill(.secondary.opacity(0.5))
                                     .frame(width: 9, height: 9)
+                                let target = controller.connectTarget(for: entry)
                                 VStack(alignment: .leading, spacing: 2) {
                                     Text(entry.name)
-                                    Text(entry.transportLabel)
+                                    Text(controller.caption(for: entry))
                                         .font(.caption)
                                         .foregroundStyle(.secondary)
                                 }
                                 Spacer()
-                                if let target = entry.preferredTarget {
+                                if let target {
                                     Button("Connect") {
                                         controller.connect(to: target, userInitiated: true)
                                     }
@@ -991,6 +1127,18 @@ struct ContentView: View {
                     }
                     .onChange(of: controller.quality) { controller.restartAll() }
                     Text(controller.quality.explanation)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Picker("Connection", selection: $controller.connectionMethod) {
+                        ForEach(ConnectionMethod.allCases, id: \.self) { method in
+                            Text(method.label).tag(method)
+                        }
+                    }
+                    .onChange(of: controller.connectionMethod) { controller.applyConnectionMethod() }
+                    Text(controller.connectionMethod.explanation)
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
