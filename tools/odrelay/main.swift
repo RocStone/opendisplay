@@ -149,7 +149,7 @@ final class Relay {
                 return schedule(after: 0.2)
             }
             log("no sender reachable over the cable — retrying")
-            backoff = min(backoff * 2, 5)
+            backoff = min(backoff * 2, 2)
             return schedule(after: backoff)
         }
         let tcp = NWProtocolTCP.Options()
@@ -189,7 +189,7 @@ final class Relay {
             } else if Date().timeIntervalSince(connectedAt) > 10 {
                 self.backoff = 1
             } else {
-                self.backoff = min(self.backoff * 2, 5)
+                self.backoff = min(self.backoff * 2, 2)
             }
             self.schedule(after: self.backoff)
         })

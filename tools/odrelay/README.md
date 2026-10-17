@@ -32,7 +32,7 @@ Receiver Mac (`odrelay`, a per-user LaunchAgent):
 - connects and waits. When the sender takes the link, it answers the pairing
   challenge, opens the receiver on loopback and pipes both ways with
   `TCP_NODELAY`;
-- reconnects within a second after a session ends, and backs off up to five
+- reconnects within a second after a session ends, and backs off up to two
   seconds while the sender is unreachable.
 
 The two Macs share a random token, so the sender only takes a relay it was
