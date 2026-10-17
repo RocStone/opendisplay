@@ -6,10 +6,12 @@ import Network
 
 func usage() -> Never {
     FileHandle.standardError.write(Data("""
-    usage: odrelay [--token-file PATH] [--receiver-port PORT]
+    usage: odrelay [--token-file PATH] [--receiver-port PORT] [--verbose]
+           odrelay --prime
 
     Keeps a connection open over the direct cable to the OpenDisplay sender's
     relay listener and pipes it to the receiver on 127.0.0.1 (default 9000).
+    --prime touches the local network once and exits (install.sh runs it).
 
     """.utf8))
     exit(64)
@@ -17,6 +19,8 @@ func usage() -> Never {
 
 var tokenURL = CableRelayWire.defaultTokenURL
 var receiverPort: UInt16 = 9000
+var verbose = false
+var prime = false
 var arguments = CommandLine.arguments.dropFirst()
 while let flag = arguments.popFirst() {
     switch flag {
@@ -26,6 +30,10 @@ while let flag = arguments.popFirst() {
     case "--receiver-port":
         guard let text = arguments.popFirst(), let port = UInt16(text) else { usage() }
         receiverPort = port
+    case "--verbose":
+        verbose = true
+    case "--prime":
+        prime = true
     default:
         usage()
     }
@@ -41,6 +49,26 @@ func log(_ line: String) {
     let stamp = ISO8601DateFormatter.string(from: Date(), timeZone: .current,
                                             formatOptions: [.withInternetDateTime])
     FileHandle.standardError.write(Data("\(stamp) \(line)\n".utf8))
+}
+
+// macOS asks before a process reaches the local network, and a LaunchAgent
+// has no way to ask: run from launchd, an unknown binary gets "local
+// network prohibited". Run once from an ssh session (allowed there), the
+// same binary at the same path is allowed from launchd too. So install.sh
+// runs this after every install: one dial toward a link-local address and a
+// Bonjour browse, the two kinds of access the helper needs.
+if prime {
+    let queue = DispatchQueue(label: "odrelay.prime")
+    let scope = DirectCable.directLinkNames().first ?? "en0"
+    let probe = NWConnection(host: NWEndpoint.Host("fe80::1%\(scope)"), port: 9, using: .tcp)
+    probe.start(queue: queue)
+    let browser = NWBrowser(for: .bonjour(type: CableRelayWire.serviceType, domain: nil), using: .tcp)
+    browser.start(queue: queue)
+    queue.asyncAfter(deadline: .now() + 2) {
+        print("local network touched over \(scope)")
+        exit(0)
+    }
+    dispatchMain()
 }
 
 guard let token = CableRelayWire.loadToken(from: tokenURL) else {
@@ -136,6 +164,7 @@ final class Relay {
         let link = RelayLink(cable: NWConnection(to: endpoint, using: params), token: token,
                              receiver: receiver, queue: queue, log: log)
         self.link = link
+        if verbose { log("dialing \(endpoint)") }
         var connected = false
         var connectedAt = Date()
         link.start(onConnected: {
@@ -146,7 +175,10 @@ final class Relay {
         }, onEnd: { [weak self] reason, carried in
             guard let self, self.link === link else { return }
             self.link = nil
-            guard connected else { return self.dial(remaining.dropFirst()) }
+            guard connected else {
+                if verbose { log("  \(endpoint): \(reason)") }
+                return self.dial(remaining.dropFirst())
+            }
             log("link ended: \(reason)")
             // A link that carried a session ended because the session did:
             // the sender wants the next one at once. One that ended soon

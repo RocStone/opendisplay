@@ -17,6 +17,7 @@ final class RelayLink {
     /// A session ran over this link: the sender took it and the receiver
     /// answered.
     private var carried = false
+    private var connected = false
 
     init(cable: NWConnection, token: String, receiver: NWEndpoint,
          queue: DispatchQueue, log: @escaping (String) -> Void) {
@@ -36,9 +37,20 @@ final class RelayLink {
             guard let self else { return }
             switch state {
             case .ready:
+                self.connected = true
                 onConnected()
                 self.awaitChallenge()
-            case .failed(let error), .waiting(let error):
+            case .waiting(let error):
+                // A fresh process's first dial often waits a moment ("network
+                // is down") before it goes out; the caller's deadline covers
+                // a dial that never does.
+                if self.connected { return self.end("cable socket: \(error)") }
+                if #available(macOS 14, *), self.cable.currentPath?.unsatisfiedReason == .localNetworkDenied {
+                    self.log("macOS denies this helper the local network — "
+                             + "run tools/odrelay/install.sh again from the sender Mac")
+                    self.end("local network denied")
+                }
+            case .failed(let error):
                 self.end("cable socket: \(error)")
             case .cancelled:
                 self.end("cable socket cancelled")

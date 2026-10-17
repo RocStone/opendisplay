@@ -60,6 +60,8 @@ receiver Mac connects in over the cable and pipes to the receiver on
 127.0.0.1:9000. Some facts it rests on, measured with F5 connected:
 connections the other Mac opens to this one get through; path monitors list
 only WiFi and the tunnel, never the cable, so cable interfaces come from
-`getifaddrs` (`DirectCable.directLinkNames`); and a launchd job on the
-receiver Mac needs no Local Network grant. Test it where the direct path
-works with `defaults write com.peetzweg.opensidecar.mac cableRelayOnly -bool YES`.
+`getifaddrs` (`DirectCable.directLinkNames`); and a LaunchAgent binary gets
+"Local network prohibited" (unified log, `--process odrelay`) until the same
+binary at the same path has run once from an ssh session, which is what
+`odrelay --prime` in the installer is for. Test the relay where the direct
+path works with `defaults write com.peetzweg.opensidecar.mac cableRelayOnly -bool YES`.

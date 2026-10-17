@@ -66,6 +66,10 @@ chmod 700 "$dir"
 chmod 600 "$dir/token"
 chmod 755 "$dir/odrelay.new"
 mv -f "$dir/odrelay.new" "$dir/odrelay"
+# The Local Network grant: see --prime in main.swift. It takes a moment to
+# reach launchd's side.
+"$dir/odrelay" --prime
+sleep 2
 plist="$HOME/Library/LaunchAgents/$label.plist"
 mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
 cat > "$plist" <<PLIST

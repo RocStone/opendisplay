@@ -1367,8 +1367,15 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     /// falling back to WiFi would resurrect what they just killed. Every
     /// other path (WiFi, routed Ethernet, the dev loopback) keeps the
     /// redial loop: a drop there is never intent.
-    private func linkDied(_ detail: String) {
-        if currentPathDirectLink, case .tcp = transport {
+    /// `closedByPeer`: the far end reset or closed the socket. On the relay
+    /// that is the relay or the receiver behind it restarting, never an
+    /// unplug (which closes nothing and goes non-viable), so it redials:
+    /// the relay is back within a second.
+    private func linkDied(_ detail: String, closedByPeer: Bool = false) {
+        if relayInUse, closedByPeer {
+            Log.info("relay connection ended (\(detail)) — redialing")
+            scheduleReconnect()
+        } else if currentPathDirectLink, case .tcp = transport {
             reportGone("cable link lost (\(detail)) — unplugging means disconnect, ending session")
         } else {
             scheduleReconnect()
@@ -1981,7 +1988,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             case .failed(let error):
                 Log.info("relay connection failed: \(error)")
                 self.connectionReady = false
-                self.linkDied("relay failed: \(error)")
+                self.linkDied("failed: \(error)", closedByPeer: true)
             case .cancelled:
                 self.connectionReady = false
             default:
@@ -2459,14 +2466,10 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                     var isOwnCancel = false
                     if case .posix(let code) = error, code == .ECANCELED { isOwnCancel = true }
                     if let self, self.connection === conn, !isOwnCancel {
-                        self.linkDied("receive failed: \(error)")
+                        self.linkDied("receive failed: \(error)", closedByPeer: true)
                     }
                 } else if let self, self.connection === conn, self.relayInUse {
-                    // The relay or the receiver behind it restarted (an
-                    // unplug closes nothing, it goes non-viable): redial,
-                    // the relay comes back within a second.
-                    Log.info("relay closed the connection — redialing")
-                    self.scheduleReconnect()
+                    self.linkDied("closed", closedByPeer: true)
                 }
                 return
             }

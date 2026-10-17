@@ -60,6 +60,14 @@ installs:
 | LaunchAgent | `~/Library/LaunchAgents/com.peetzweg.opensidecar.odrelay.plist` |
 | log | `~/Library/Logs/OpenDisplayRelay.log` |
 
+macOS lets a process reach the local network only once it is allowed to,
+and a LaunchAgent cannot ask: started by launchd, an unknown binary gets
+"local network prohibited". Run once from an ssh session, where it is
+allowed, the same binary at the same path is allowed from launchd too, so
+the installer runs `odrelay --prime` over ssh after every install. If the
+helper ever logs that macOS denies it the local network, run the installer
+again.
+
 Run it again to update the helper; the token stays. OpenDisplay notices a
 newly installed token by itself; it listens only while Connection is Cable.
 
@@ -82,4 +90,5 @@ and wait for the relay, to exercise it where the direct path works. Delete
 the key to go back.
 
 The sender logs `cable relay:` lines and `runs over the relay` to
-`~/Library/Logs/OpenDisplay/opendisplay.log`; the helper logs to its own file.
+`~/Library/Logs/OpenDisplay/opendisplay.log`; the helper logs to its own file,
+every dial with `--verbose`.
