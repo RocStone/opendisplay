@@ -52,7 +52,8 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     // Fired once a TCP connection is live, with whether it runs over a
     // wired path (Thunderbolt Bridge / Ethernet) rather than WiFi — the UI
     // labels the row so the user can see the cable is actually in use.
-    @MainActor var onTransportPath: ((_ wired: Bool) -> Void)?
+    // `viaRelay`: the socket came from the reverse relay (CableRelay.swift).
+    @MainActor var onTransportPath: ((_ wired: Bool, _ viaRelay: Bool) -> Void)?
     // Fired on every hello — carries the receiver's install id so the
     // controller can deduplicate USB/WiFi sessions to the same device.
     @MainActor var onHello: ((PhoneInfo) -> Void)?
@@ -252,6 +253,21 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     // the session decides to redial (scheduleReconnect/switchTransport):
     // dial-phase failures take the grace/refusal rules, never this exit.
     private var currentPathDirectLink = false
+    // Reverse relay (CableRelay.swift), set in the Cable connection method:
+    // a cable dial that has not answered after a short head start takes the
+    // socket the relay on the receiver Mac opened to us, and a session on
+    // the relay keeps trying the direct path so it moves back when that
+    // works again. All on `queue`.
+    private var relay: CableRelayHub?
+    private var relayInUse = false
+    private var relayClaiming = false
+    private var dialStartedAt = Date.distantPast
+    private var directProbe: NWConnection?
+    private static let relayHeadStart: TimeInterval = 1.0
+    private static let directProbeInterval: TimeInterval = 30
+    // Test knob (-cableRelayOnly YES): never dial the cable directly, so the
+    // relay can be exercised where the direct path happens to work.
+    private var relayOnly: Bool { UserDefaults.standard.bool(forKey: "cableRelayOnly") }
     private var lastCursorSent: (x: Double, y: Double, visible: Bool) = (-1, -1, false)
     private var lastCursorPNGHash = 0
     // Cursor side channel (UDP, WiFi only): positions queue behind video
@@ -354,8 +370,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     init(transport: SenderTransport, name: String, mode: CaptureMode,
          quality: StreamQuality = .best, displaySerial: UInt32 = 0x0001,
          identityOffset: UInt32 = 0, awaitingWake: Bool = false,
-         cableUpgradeAllowed: Bool = true) {
+         cableUpgradeAllowed: Bool = true, relay: CableRelayHub? = nil) {
         self.transport = transport
+        self.relay = relay
         self.cableUpgradeAllowed = cableUpgradeAllowed
         self.endpointName = name
         self.mode = mode
@@ -1251,6 +1268,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         queue.async { [weak self] in
             self?.closeCursorChannel()
             self?.stopUpgradeProbing()
+            self?.leaveRelay()
             self?.captureRecoveryWork?.cancel()
             self?.captureRecoveryWork = nil
         }
@@ -1287,6 +1305,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             self.disconnectedSince = Date()
             self.connectionReady = false
             self.currentPathDirectLink = false   // the new transport re-classifies
+            self.leaveRelay()
             self.dialGeneration += 1   // a dial still in flight must not adopt
             self.connection?.cancel()
             self.connection = nil
@@ -1313,6 +1332,22 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         }
     }
 
+    /// The connection method changed: the relay is there (Cable) or not.
+    /// A session already on it keeps running until it next redials.
+    func setRelay(_ hub: CableRelayHub?) {
+        queue.async { [weak self] in
+            self?.relay = hub
+        }
+    }
+
+    /// The relay on the receiver Mac connected: a cable dial still waiting
+    /// for an answer takes it.
+    func relayArrived() {
+        queue.async { [weak self] in
+            self?.tryRelay()
+        }
+    }
+
     // The controller's end() is idempotent, but several detectors (grace,
     // refusals, service withdrawal) can conclude "gone" repeatedly while the
     // stop is in flight — report once so the log tells the story once.
@@ -1332,8 +1367,15 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     /// falling back to WiFi would resurrect what they just killed. Every
     /// other path (WiFi, routed Ethernet, the dev loopback) keeps the
     /// redial loop: a drop there is never intent.
-    private func linkDied(_ detail: String) {
-        if currentPathDirectLink, case .tcp = transport {
+    /// `closedByPeer`: the far end reset or closed the socket. On the relay
+    /// that is the relay or the receiver behind it restarting, never an
+    /// unplug (which closes nothing and goes non-viable), so it redials:
+    /// the relay is back within a second.
+    private func linkDied(_ detail: String, closedByPeer: Bool = false) {
+        if relayInUse, closedByPeer {
+            Log.info("relay connection ended (\(detail)) — redialing")
+            scheduleReconnect()
+        } else if currentPathDirectLink, case .tcp = transport {
             reportGone("cable link lost (\(detail)) — unplugging means disconnect, ending session")
         } else {
             scheduleReconnect()
@@ -1607,8 +1649,10 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 && !path.usesInterfaceType(.cellular)
             currentPathUsesWiFi = path.usesInterfaceType(.wifi)
             let names = path.availableInterfaces.map(\.name).joined(separator: ",")
-            Log.info("connection path to \(endpointName): \(names) wired=\(wired) direct=\(currentPathDirectLink)")
-            Task { @MainActor in self.onTransportPath?(wired) }
+            let viaRelay = relayInUse
+            Log.info("connection path to \(endpointName): \(names) wired=\(wired) direct=\(currentPathDirectLink)"
+                     + (viaRelay ? " via relay" : ""))
+            Task { @MainActor in self.onTransportPath?(wired, viaRelay) }
         }
         // -forceUpgradeProbe YES: dev knob — loopback runs never look like
         // WiFi, so this is the only way to exercise probe+migrate on one Mac.
@@ -1745,10 +1789,11 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     /// Swap the live session onto the probed connection. Same shape as a
     /// reconnect: the receiver parks the newcomer, adopts it on our first
     /// bytes, and the abandoned WiFi socket's EOF is ignored as stale.
-    private func migrate(to conn: NWConnection) {
+    private func migrate(to conn: NWConnection, leaving: String = "WiFi") {
         let names = conn.currentPath?.availableInterfaces.map(\.name)
             .joined(separator: ",") ?? "?"
-        Log.info("cable path answered (\(names)) — migrating the session off WiFi")
+        Log.info("cable path answered (\(names)) — migrating the session off \(leaving)")
+        leaveRelay()
         upgradeProbes.removeAll { $0 === conn }
         stopUpgradeProbing()
         dialGeneration += 1   // a redial in flight must not clobber this
@@ -1817,6 +1862,13 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     private func connectTCP(_ endpoint: NWEndpoint) {
+        if relayOnly, relay != nil, pinnedCableInterface != nil {
+            Log.info("cableRelayOnly: waiting for the relay instead of dialing the cable")
+            connection = nil
+            dialStartedAt = .distantPast
+            tryRelay()
+            return
+        }
         let options = NWProtocolTCP.Options()
         options.noDelay = true   // latency matters more than throughput here
         // No interface steering by default: macOS usually ranks a Thunderbolt
@@ -1888,6 +1940,105 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             }
         }
         conn.start(queue: queue)
+        dialStartedAt = Date()
+        if relay != nil, pinnedCableInterface != nil {
+            queue.asyncAfter(deadline: .now() + Self.relayHeadStart) { [weak self] in
+                guard let self, generation == self.dialGeneration else { return }
+                self.tryRelay()
+            }
+        }
+    }
+
+    // MARK: - Reverse relay (CableRelay.swift)
+
+    /// Take the relay's socket if this session is dialing the cable and the
+    /// direct dial had its head start (on `queue`).
+    private func tryRelay() {
+        guard !stopped, !connectionReady, !relayClaiming, let relay,
+              pinnedCableInterface != nil,
+              Date().timeIntervalSince(dialStartedAt) >= Self.relayHeadStart - 0.05,
+              let (socket, interface) = relay.take() else { return }
+        relayClaiming = true
+        CableRelayHub.activate(socket, token: relay.token, queue: queue) { [weak self] ok in
+            guard let self else { return socket.cancel() }
+            self.relayClaiming = false
+            // A failed one was a stale socket (the relay restarted since):
+            // the next one, if any.
+            guard ok else { return self.tryRelay() }
+            guard !self.stopped, !self.connectionReady, self.pinnedCableInterface != nil else {
+                return socket.cancel()
+            }
+            self.adoptRelay(socket, over: interface)
+        }
+    }
+
+    private func adoptRelay(_ conn: NWConnection, over interface: String) {
+        Log.info("cable relay answered over \(interface) — \(endpointName) runs over the relay")
+        dialGeneration += 1   // a dial or redial in flight must not clobber this
+        if let direct = connection {
+            direct.stateUpdateHandler = nil
+            direct.viabilityUpdateHandler = nil
+            direct.cancel()
+        }
+        connection = conn
+        relayInUse = true
+        conn.stateUpdateHandler = { [weak self] state in
+            guard let self, self.connection === conn else { return }
+            switch state {
+            case .failed(let error):
+                Log.info("relay connection failed: \(error)")
+                self.connectionReady = false
+                self.linkDied("failed: \(error)", closedByPeer: true)
+            case .cancelled:
+                self.connectionReady = false
+            default:
+                break
+            }
+        }
+        becomeReady(conn)
+        scheduleDirectProbe()
+    }
+
+    /// Forget the relay before the session's socket is replaced.
+    private func leaveRelay() {
+        relayInUse = false
+        directProbe?.cancel()
+        directProbe = nil
+    }
+
+    /// While on the relay, dial the cable directly now and then, and move
+    /// the session there once it answers (the VPN went away).
+    private func scheduleDirectProbe() {
+        let generation = connectionGeneration
+        queue.asyncAfter(deadline: .now() + Self.directProbeInterval) { [weak self] in
+            guard let self, !self.stopped, self.relayInUse, self.connectionReady,
+                  generation == self.connectionGeneration else { return }
+            // The test knob only pauses the probing: dropping it mid-session
+            // must bring the direct path back.
+            guard !self.relayOnly, case .tcp(let endpoint) = self.transport,
+                  case .service(_, _, _, let interface?) = endpoint else { return self.scheduleDirectProbe() }
+            let tcp = NWProtocolTCP.Options()
+            tcp.noDelay = true
+            let params = NWParameters(tls: nil, tcp: tcp)
+            params.requiredInterface = interface
+            let probe = NWConnection(to: endpoint, using: params)
+            self.directProbe = probe
+            probe.stateUpdateHandler = { [weak self] state in
+                guard let self, self.directProbe === probe else { return }
+                if case .ready = state, self.relayInUse,
+                   generation == self.connectionGeneration {
+                    self.directProbe = nil
+                    self.migrate(to: probe, leaving: "the relay")
+                }
+            }
+            probe.start(queue: self.queue)
+            self.queue.asyncAfter(deadline: .now() + 3) { [weak self] in
+                guard let self, self.directProbe === probe else { return }
+                self.directProbe = nil
+                probe.cancel()
+                self.scheduleDirectProbe()
+            }
+        }
     }
 
     /// The direct-cable interface this dial is scoped to (Cable connection
@@ -1904,7 +2055,10 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     @discardableResult
     private func reportCableDialTrouble() -> Bool {
         guard !awaitingWake, let name = pinnedCableInterface else { return false }
-        let text = CableDialTrouble.hint(interface: name, tunnel: CableDialTrouble.linkLocalTunnel())
+        // The relay is about to answer for the cable: nothing to explain.
+        if relayClaiming || relay?.hasWaiting == true { return true }
+        let text = CableDialTrouble.hint(interface: name, tunnel: CableDialTrouble.linkLocalTunnel(),
+                                         relayExpected: relay != nil)
         Task { await status(text) }
         return true
     }
@@ -1982,6 +2136,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         // an ordinary reconnecting session now. A stale direct-link flag here
         // would let the first dial hiccup end the session via linkDied.
         currentPathDirectLink = false
+        leaveRelay()
         dialGeneration += 1   // a USB dial still in flight must not adopt
         let generation = dialGeneration
         connection?.cancel()
@@ -2166,7 +2321,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     /// Bonjour or Thunderbolt-bridged dial lands on the same interface. Any
     /// failure here is silent: the cursor keeps riding TCP.
     private func openCursorChannel(port: Int) {
-        guard case .tcp = transport, let conn = connection, connectionReady,
+        // Not over the relay: it carries the TCP stream only, and a datagram
+        // dialed from here is what the VPN drops.
+        guard case .tcp = transport, let conn = connection, connectionReady, !relayInUse,
               port > 0, port <= Int(UInt16.max),
               let udpPort = NWEndpoint.Port(rawValue: UInt16(port)) else {
             closeCursorChannel()
@@ -2311,8 +2468,10 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                     var isOwnCancel = false
                     if case .posix(let code) = error, code == .ECANCELED { isOwnCancel = true }
                     if let self, self.connection === conn, !isOwnCancel {
-                        self.linkDied("receive failed: \(error)")
+                        self.linkDied("receive failed: \(error)", closedByPeer: true)
                     }
+                } else if let self, self.connection === conn, self.relayInUse {
+                    self.linkDied("closed", closedByPeer: true)
                 }
                 return
             }

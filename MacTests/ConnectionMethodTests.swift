@@ -101,6 +101,13 @@ final class ConnectionMethodTests: XCTestCase {
         XCTAssertFalse(CableDialTrouble.hint(interface: "en8", tunnel: nil).contains("VPN"))
     }
 
+    func testCableTroubleWithARelayPointsAtTheRelay() {
+        // With a relay paired, the VPN no longer decides: a missing relay does.
+        let hint = CableDialTrouble.hint(interface: "en8", tunnel: "utun8", relayExpected: true)
+        XCTAssertTrue(hint.contains("en8") && hint.contains("relay"))
+        XCTAssertFalse(hint.contains("VPN"))
+    }
+
     func testTunnelInterfacesAreRecognized() {
         XCTAssertTrue(CableDialTrouble.isTunnel("utun8"))
         XCTAssertTrue(CableDialTrouble.isTunnel("ipsec0"))

@@ -45,6 +45,27 @@ enum DirectCable {
         }
     }
 
+    /// Local interfaces that look like the cable by name and addresses
+    /// alone: an up, plain wired interface (en, bridge) holding nothing but
+    /// link-local addresses. For when no NWInterface is to be had: with a
+    /// VPN connected, path monitors list the tunnel and WiFi, not the cable.
+    static func directLinkNames() -> [String] {
+        var names: [String] = []
+        var list: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&list) == 0, let first = list else { return names }
+        defer { freeifaddrs(list) }
+        for ptr in sequence(first: first, next: { $0.pointee.ifa_next }) {
+            let flags = Int32(ptr.pointee.ifa_flags)
+            let name = String(cString: ptr.pointee.ifa_name)
+            guard flags & IFF_UP != 0, flags & IFF_RUNNING != 0, flags & IFF_LOOPBACK == 0,
+                  flags & IFF_POINTOPOINT == 0,
+                  name.hasPrefix("en") || name.hasPrefix("bridge"),
+                  !names.contains(name) else { continue }
+            names.append(name)
+        }
+        return names.filter { onlyLinkLocal(addresses(of: $0)) }
+    }
+
     /// Every IPv4/IPv6 address on the named interface, scope ids stripped.
     private static func addresses(of name: String) -> [String] {
         var result: [String] = []

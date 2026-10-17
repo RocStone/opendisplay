@@ -58,7 +58,8 @@ targets:
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         LSUIElement: true
         NSLocalNetworkUsageDescription: OpenDisplay connects to your iPad or iPhone over the local network in WiFi mode.
-        NSBonjourServices: ["_opensidecar._tcp"]
+        # _odrelay._tcp: the cable relay's listener (Mac/CableRelay.swift).
+        NSBonjourServices: ["_opensidecar._tcp", "_odrelay._tcp"]
         LSApplicationCategoryType: public.app-category.utilities
         # --- Sparkle auto-update: off in this fork ---
         # Upstream's feed (opendisplay.app/appcast.xml) would replace this
@@ -73,8 +74,8 @@ targets:
         BUNDLE_DISPLAY_NAME: OpenDisplay
         # The fork's version: the upstream release it is based on plus a
         # fork suffix. The build number sits above upstream 1.25.0's (178).
-        MARKETING_VERSION: "1.25.0-roc.2"
-        CURRENT_PROJECT_VERSION: "180"
+        MARKETING_VERSION: "1.25.0-roc.3"
+        CURRENT_PROJECT_VERSION: "181"
         SWIFT_OBJC_BRIDGING_HEADER: Mac/OpenSidecarMac-Bridging-Header.h
         ENABLE_HARDENED_RUNTIME: YES
         CODE_SIGN_ENTITLEMENTS: Mac/OpenSidecarMac.entitlements
@@ -152,6 +153,9 @@ targets:
       - Mac/DisplayArrangement.swift
       - Mac/StreamConfiguration.swift
       - Mac/ConnectionMethod.swift
+      - Mac/CableRelay.swift
+      - Mac/CableRelayWire.swift
+      - tools/odrelay/RelayLink.swift
       - Mac/VirtualCanvasSizing.swift
       - Mac/PhoneInfo.swift
       - Mac/DesktopPolicy.swift
