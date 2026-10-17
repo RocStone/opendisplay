@@ -150,8 +150,12 @@ final class DeviceSession: ObservableObject, Identifiable {
     // The live TCP path runs over a cable (Thunderbolt Bridge / Ethernet)
     // rather than WiFi — reported by the sender once connected.
     @Published var wired = false
+    // ...and its socket came from the reverse relay (CableRelay.swift).
+    @Published var viaRelay = false
 
-    var transportLabel: String { onUSB ? "USB" : wired ? "Cable" : "WiFi" }
+    var transportLabel: String {
+        onUSB ? "USB" : wired ? (viaRelay ? "Cable · via relay" : "Cable") : "WiFi"
+    }
 
     // The Display size control (extend only): the choice for this device
     // and what each choice gives on it, from the latest hello.
@@ -284,8 +288,12 @@ final class SenderController: ObservableObject {
     // Every service seen on the cable this run: a Disconnect counts as a
     // cable opt-out even while the record is briefly gone (receiver asleep).
     private var everOnCable: Set<String> = []
+    // The reverse relay's listener (CableRelay.swift): up in the Cable
+    // connection method once this Mac holds a relay token.
+    private var relayHub: CableRelayHub?
 
     init() {
+        updateRelayHub()
         startBrowsing()
         usbWatcher = UsbmuxDeviceWatcher { [weak self] devices in
             guard let self else { return }
@@ -309,6 +317,8 @@ final class SenderController: ObservableObject {
                 guard let self else { return }
                 let before = Set(self.discovered.compactMap(self.serviceName(of:)))
                 self.discovered = Array(results)
+                // Picks up a token installed while the app runs.
+                self.updateRelayHub()
                 self.followMovedRecords(advertisedBefore: before)
                 self.endSessionsWhoseServiceVanished()
                 self.autoConnect()
@@ -434,19 +444,57 @@ final class SenderController: ObservableObject {
         let plugged = nowOnCable.subtracting(onDirectCable)
         onDirectCable = nowOnCable
         everOnCable.formUnion(nowOnCable)
+        connectCabled(plugged, why: "appeared on the direct cable")
+    }
+
+    private func connectCabled(_ names: Set<String>, why: String) {
         guard connectionMethod.connectsOnCablePlug else { return }
-        guard autoConnectEnabled, !plugged.isEmpty else { return }
+        guard autoConnectEnabled, !names.isEmpty else { return }
         for result in discovered {
-            guard let name = serviceName(of: result), plugged.contains(name),
+            guard let name = serviceName(of: result), names.contains(name),
                   !cableOptOut.contains(name),
                   activeSession(coveringWiFi: result) == nil,
                   !alreadyServedOnCable(result),
                   // A USB-attached phone belongs to the usbmux path and its
                   // own opt-out, never this one.
                   !usbDevices.contains(where: { sameDevice(result, $0) }) else { continue }
-            Log.info("\(name) appeared on the direct cable — connecting")
+            Log.info("\(name) \(why) — connecting")
             connect(to: .wifi(result))
         }
+    }
+
+    // MARK: - Reverse relay (CableRelay.swift)
+
+    /// The relay listens in the Cable connection method, and only once a
+    /// token is installed (tools/odrelay/install.sh).
+    private func updateRelayHub() {
+        if connectionMethod == .cable {
+            guard relayHub == nil, let token = CableRelayWire.loadToken() else { return }
+            let hub = CableRelayHub(token: token)
+            hub.onArrival = { [weak self] in self?.relayArrived() }
+            hub.start()
+            relayHub = hub
+            sessions.forEach { $0.sender.setRelay(hub) }
+        } else if let hub = relayHub {
+            hub.stop()
+            relayHub = nil
+            sessions.forEach { $0.sender.setRelay(nil) }
+        }
+    }
+
+    /// The relay on a receiver Mac connected: a session dialing the cable
+    /// takes it, and a cabled receiver without a session connects the way a
+    /// plugged-in one does (a session that ended while the relay was away).
+    private func relayArrived() {
+        for session in sessions where !session.failed && !session.onUSB {
+            session.sender.relayArrived()
+        }
+        connectViaWaitingRelay()
+    }
+
+    private func connectViaWaitingRelay() {
+        guard connectionMethod == .cable, relayHub?.hasWaiting == true else { return }
+        connectCabled(onDirectCable, why: "has the cable relay waiting")
     }
 
     /// A live session may already talk to this receiver under another
@@ -522,6 +570,7 @@ final class SenderController: ObservableObject {
     /// are and re-arms the upgrade and the USB takeover.
     func applyConnectionMethod() {
         Log.info("connection method: \(connectionMethod.label)")
+        updateRelayHub()
         for session in sessions where !session.failed {
             session.sender.setCableUpgradeAllowed(connectionMethod.switchesPathsOnItsOwn)
             guard connectionMethod != .automatic else {
@@ -790,7 +839,8 @@ final class SenderController: ObservableObject {
                                quality: quality, displaySerial: Self.displaySerial(for: id),
                                identityOffset: identityOffset(for: id),
                                awaitingWake: awaitingWake,
-                               cableUpgradeAllowed: connectionMethod.switchesPathsOnItsOwn)
+                               cableUpgradeAllowed: connectionMethod.switchesPathsOnItsOwn,
+                               relay: connectionMethod == .cable ? relayHub : nil)
         let session = DeviceSession(id: id, target: target, name: name, sender: sender)
         if case .wifi(let result) = target {
             session.wifiServiceName = serviceName(of: result)
@@ -832,6 +882,11 @@ final class SenderController: ObservableObject {
             guard let self, let session else { return }
             Log.info("device disconnected — session \(session.id) stopped")
             self.end(session)
+            // The relay may already be back, waiting (its arrival found the
+            // session still winding down).
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+                self?.connectViaWaitingRelay()
+            }
         }
         sender.onPeerSleeping = { [weak self, weak session] in
             // The device locked. Unlike a plain disconnect this is a
@@ -862,8 +917,9 @@ final class SenderController: ObservableObject {
             Log.info("display identity for \(session.id) moved to offset \(totalOffset) — "
                 + "macOS saved hostile state for the old one")
         }
-        sender.onTransportPath = { [weak session] wired in
+        sender.onTransportPath = { [weak session] wired, viaRelay in
             session?.wired = wired
+            session?.viaRelay = viaRelay
         }
         sender.onPeerClosed = { [weak self, weak session] in
             // The receiver app quit — a deliberate goodbye, so no reconnect

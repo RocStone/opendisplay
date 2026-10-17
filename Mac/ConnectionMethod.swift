@@ -148,7 +148,13 @@ enum ServiceRoute: Equatable {
 /// IPv6 link-local included. No socket option gets past a missing route;
 /// interfaces that were already up when the VPN connected keep theirs.
 enum CableDialTrouble {
-    static func hint(interface: String, tunnel: String?) -> String {
+    /// `relayExpected`: this Mac is paired with a cable relay
+    /// (CableRelay.swift), which has not connected.
+    static func hint(interface: String, tunnel: String?, relayExpected: Bool = false) -> String {
+        if relayExpected {
+            return "No answer over the cable (\(interface)), and the cable relay on the receiver "
+                + "has not connected — is it running there?"
+        }
         if let tunnel {
             return "No answer over the cable (\(interface)) — the VPN on \(tunnel) blocks it. "
                 + "Reconnect the VPN with the cable plugged in, or turn it off."
