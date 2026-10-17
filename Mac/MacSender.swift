@@ -2012,9 +2012,11 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         let generation = connectionGeneration
         queue.asyncAfter(deadline: .now() + Self.directProbeInterval) { [weak self] in
             guard let self, !self.stopped, self.relayInUse, self.connectionReady,
-                  generation == self.connectionGeneration, !self.relayOnly,
-                  case .tcp(let endpoint) = self.transport,
-                  case .service(_, _, _, let interface?) = endpoint else { return }
+                  generation == self.connectionGeneration else { return }
+            // The test knob only pauses the probing: dropping it mid-session
+            // must bring the direct path back.
+            guard !self.relayOnly, case .tcp(let endpoint) = self.transport,
+                  case .service(_, _, _, let interface?) = endpoint else { return self.scheduleDirectProbe() }
             let tcp = NWProtocolTCP.Options()
             tcp.noDelay = true
             let params = NWParameters(tls: nil, tcp: tcp)
