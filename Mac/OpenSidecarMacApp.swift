@@ -307,7 +307,9 @@ final class SenderController: ObservableObject {
         browser.browseResultsChangedHandler = { [weak self] results, _ in
             DispatchQueue.main.async {
                 guard let self else { return }
+                let before = Set(self.discovered.compactMap(self.serviceName(of:)))
                 self.discovered = Array(results)
+                self.followMovedRecords(advertisedBefore: before)
                 self.endSessionsWhoseServiceVanished()
                 self.autoConnect()
                 self.connectNewlyCabled()
@@ -487,6 +489,30 @@ final class SenderController: ObservableObject {
             return .service(name: service, type: type, domain: domain, interface: interface)
         case .unavailable:
             return nil
+        }
+    }
+
+    /// A pinned session dials one interface. When its receiver's record
+    /// leaves that interface (a replugged USB-C cable comes back as a new
+    /// one: en4 before, en8 after), redial where the record is now instead
+    /// of waiting on a link that is gone. The plug itself can't do this:
+    /// connectNewlyCabled skips a device whose session already exists.
+    /// A record that just came back also tells a session waiting for wake
+    /// that its receiver is up (it withdraws the service while asleep).
+    private func followMovedRecords(advertisedBefore: Set<String>) {
+        for session in sessions where !session.failed && !session.onUSB {
+            guard let result = wifiService(for: session) else { continue }
+            if let name = serviceName(of: result), !advertisedBefore.contains(name) {
+                session.sender.peerServiceAdvertised()
+            }
+            guard connectionMethod != .automatic,
+                  let pinned = session.pinnedInterface,
+                  let next = connectionMethod.repin(
+                      from: pinned, among: result.interfaces.map(RouteInterface.init)),
+                  let endpoint = endpoint(for: result) else { continue }
+            Log.info("\(session.id): receiver moved from \(pinned) to \(next) — redialing there")
+            session.pinnedInterface = next
+            session.sender.switchTransport(to: .tcp(endpoint))
         }
     }
 

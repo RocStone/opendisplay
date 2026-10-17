@@ -68,6 +68,47 @@ final class ConnectionMethodTests: XCTestCase {
         XCTAssertEqual(ConnectionMethod.cable.pick(usb: nil, network: (target: "mac", route: .pinned("en7"))), "mac")
     }
 
+    // The receiver's cable came back as another interface (replugged, or
+    // re-enumerated by the port): the dial scoped to the old one must move.
+    func testPinFollowsTheCableToItsNewInterface() {
+        let replugged = RouteInterface(name: "en8", isWiFi: false, isDirectLink: true)
+        XCTAssertEqual(ConnectionMethod.cable.repin(from: "en4", among: [anri, replugged, wifi]), "en8")
+        XCTAssertEqual(ConnectionMethod.wifi.repin(from: "en5", among: [cable, wifi]), "en0")
+    }
+
+    func testPinStaysWhileItStillReachesTheReceiver() {
+        let second = RouteInterface(name: "en8", isWiFi: false, isDirectLink: true)
+        // Browse order alone never moves a session.
+        XCTAssertNil(ConnectionMethod.cable.repin(from: "en7", among: [second, cable, wifi]))
+        XCTAssertNil(ConnectionMethod.cable.repin(from: "en7", among: [cable]))
+        XCTAssertNil(ConnectionMethod.wifi.repin(from: "en0", among: [officeLAN, wifi]))
+    }
+
+    func testPinMovesUpFromAnriWhenTheRealCableAppears() {
+        XCTAssertEqual(ConnectionMethod.cable.repin(from: "anri0", among: [anri, cable]), "en7")
+        XCTAssertEqual(ConnectionMethod.wifi.repin(from: "en5", among: [officeLAN, wifi]), "en0")
+    }
+
+    func testPinStaysWhenTheMethodHasNowhereElseToGo() {
+        // The record lost the cable entirely: withdrawal handling owns that.
+        XCTAssertNil(ConnectionMethod.cable.repin(from: "en7", among: [wifi]))
+        XCTAssertNil(ConnectionMethod.automatic.repin(from: "en7", among: [cable, wifi]))
+    }
+
+    func testCableTroubleNamesTheBlockingVPN() {
+        let blocked = CableDialTrouble.hint(interface: "en8", tunnel: "utun8")
+        XCTAssertTrue(blocked.contains("en8") && blocked.contains("utun8") && blocked.contains("VPN"))
+        XCTAssertFalse(CableDialTrouble.hint(interface: "en8", tunnel: nil).contains("VPN"))
+    }
+
+    func testTunnelInterfacesAreRecognized() {
+        XCTAssertTrue(CableDialTrouble.isTunnel("utun8"))
+        XCTAssertTrue(CableDialTrouble.isTunnel("ipsec0"))
+        XCTAssertTrue(CableDialTrouble.isTunnel("ppp0"))
+        XCTAssertFalse(CableDialTrouble.isTunnel("en0"))
+        XCTAssertFalse(CableDialTrouble.isTunnel("bridge0"))
+    }
+
     func testChoiceIsPersistedAndDefaultsToAutomatic() {
         let defaults = UserDefaults(suiteName: "ConnectionMethodTests")!
         defaults.removePersistentDomain(forName: "ConnectionMethodTests")

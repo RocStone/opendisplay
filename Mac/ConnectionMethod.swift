@@ -1,3 +1,4 @@
+import Darwin
 import Network
 
 /// Which paths the sender may use to reach a receiver. Automatic is the
@@ -56,23 +57,53 @@ enum ConnectionMethod: String, CaseIterable {
     /// How to dial a receiver's Bonjour service, given the local interfaces
     /// its record was seen on.
     func route(among interfaces: [RouteInterface]) -> ServiceRoute {
+        guard self != .automatic else { return .anyPath }
+        return candidates(among: interfaces).first.map { .pinned($0.name) } ?? .unavailable
+    }
+
+    /// The interface a pinned dial should move onto now that the receiver's
+    /// record is seen on `interfaces`, or nil to stay on `pinned`. A
+    /// replugged USB-C cable can come back as a different interface (en4
+    /// one minute, en8 the next), and a dial scoped to the old one waits
+    /// forever. A pin that still reaches the receiver stays put unless a
+    /// better kind of link turned up (the real cable next to anri), so a
+    /// mere change in browse order never moves a session.
+    func repin(from pinned: String, among interfaces: [RouteInterface]) -> String? {
+        let ranked = candidates(among: interfaces)
+        guard let best = ranked.first, best.name != pinned else { return nil }
+        guard let current = ranked.first(where: { $0.name == pinned }) else { return best.name }
+        return rank(best) < rank(current) ? best.name : nil
+    }
+
+    /// The interfaces this method may dial over, best first.
+    private func candidates(among interfaces: [RouteInterface]) -> [RouteInterface] {
+        let allowed: [RouteInterface]
+        switch self {
+        case .automatic: return []
+        // A routed wired path (a docked Mac on the office LAN) is still the
+        // network, not the cable.
+        case .cable: allowed = interfaces.filter(\.isDirectLink)
+        case .wifi: allowed = interfaces.filter { !$0.isDirectLink }
+        }
+        // Stable: within a rank, the browse result's order decides.
+        return allowed.enumerated()
+            .sorted { (rank($0.element), $0.offset) < (rank($1.element), $1.offset) }
+            .map(\.element)
+    }
+
+    /// Lower is better.
+    private func rank(_ interface: RouteInterface) -> Int {
         switch self {
         case .automatic:
-            return .anyPath
+            return 0
         case .cable:
             // anri* is wired and link-local like the cable, but it is an
             // Apple-internal link next to the real one (its anpi* sibling
             // completes handshakes without carrying the stream). Only use it
             // when nothing else is there.
-            let links = interfaces.filter(\.isDirectLink)
-            let pick = links.first { !$0.name.hasPrefix("anri") } ?? links.first
-            return pick.map { .pinned($0.name) } ?? .unavailable
+            return interface.name.hasPrefix("anri") ? 1 : 0
         case .wifi:
-            // Anything but the cable, WiFi first. A routed wired path (a
-            // docked Mac on the office LAN) is still the network.
-            let network = interfaces.filter { !$0.isDirectLink }
-            let pick = network.first(where: \.isWiFi) ?? network.first
-            return pick.map { .pinned($0.name) } ?? .unavailable
+            return interface.isWiFi ? 0 : 1
         }
     }
 
@@ -107,4 +138,65 @@ enum ServiceRoute: Equatable {
     case pinned(String)
     /// The method rules out every interface the record was seen on.
     case unavailable
+}
+
+/// Why a dial pinned to the direct cable gets nowhere, for the session row.
+/// A VPN that routes link-local traffic into its tunnel can also delete the
+/// cable's own routes: F5's "prohibit routing table changes" removes every
+/// route of an interface that comes up while the tunnel is connected, so a
+/// cable plugged in (or re-enumerated) mid-session carries nothing at all,
+/// IPv6 link-local included. No socket option gets past a missing route;
+/// interfaces that were already up when the VPN connected keep theirs.
+enum CableDialTrouble {
+    static func hint(interface: String, tunnel: String?) -> String {
+        if let tunnel {
+            return "No answer over the cable (\(interface)) — the VPN on \(tunnel) blocks it. "
+                + "Reconnect the VPN with the cable plugged in, or turn it off."
+        }
+        return "No answer over the cable (\(interface)) — is the receiver running?"
+    }
+
+    /// Tunnel interfaces as macOS names them (utun for Network Extension
+    /// and most third-party VPNs, ipsec and ppp for the built-in ones).
+    static func isTunnel(_ name: String) -> Bool {
+        ["utun", "ipsec", "ppp"].contains { name.hasPrefix($0) }
+    }
+
+    /// The tunnel interface the system routes IPv4 link-local traffic
+    /// through, nil when it stays local. Connecting an unbound UDP socket
+    /// sends nothing; it only runs the route lookup, and the source address
+    /// it picks names the interface.
+    static func linkLocalTunnel() -> String? {
+        let fd = socket(AF_INET, SOCK_DGRAM, 0)
+        guard fd >= 0 else { return nil }
+        defer { close(fd) }
+        var dst = sockaddr_in()
+        dst.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        dst.sin_family = sa_family_t(AF_INET)
+        dst.sin_port = in_port_t(9).bigEndian
+        dst.sin_addr.s_addr = inet_addr("169.254.255.254")
+        var src = sockaddr_in()
+        var len = socklen_t(MemoryLayout<sockaddr_in>.size)
+        let ok = withUnsafePointer(to: &dst) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) == 0
+            }
+        } && withUnsafeMutablePointer(to: &src) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(fd, $0, &len) == 0 }
+        }
+        guard ok else { return nil }
+        return interfaceName(holding: src.sin_addr.s_addr).flatMap { isTunnel($0) ? $0 : nil }
+    }
+
+    private static func interfaceName(holding address: in_addr_t) -> String? {
+        var list: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&list) == 0, let first = list else { return nil }
+        defer { freeifaddrs(list) }
+        for ptr in sequence(first: first, next: { $0.pointee.ifa_next }) {
+            guard let sa = ptr.pointee.ifa_addr, sa.pointee.sa_family == UInt8(AF_INET) else { continue }
+            let addr = sa.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee.sin_addr.s_addr }
+            if addr == address { return String(cString: ptr.pointee.ifa_name) }
+        }
+        return nil
+    }
 }

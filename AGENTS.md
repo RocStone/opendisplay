@@ -43,3 +43,13 @@ pins a Bonjour dial to one local interface with
 `.service(name:type:domain:interface:)` plus `requiredInterface`. That
 resolves at once; a dial that only prohibits WiFi can wander onto a VPN's
 utun interface and hang.
+
+A VPN can make the cable unusable no matter how the dial is pinned. F5's
+client with "prohibit routing table changes" deletes every route of an
+interface that comes up while its tunnel is connected (IPv6 link-local and
+multicast included) and routes 169.254/16 into its utun. A replugged USB-C
+cable often comes back as a new interface (en4 → en8), so it hits this.
+`route -n monitor` shows the VPN daemon's RTM_DELETEs; `netstat -rn -f inet6`
+lacks `fe80::%enX/64` for the cable. Interfaces that were up when the VPN
+connected keep their routes. The sender says so in the session row
+(`CableDialTrouble` in `Mac/ConnectionMethod.swift`).

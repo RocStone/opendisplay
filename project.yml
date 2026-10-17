@@ -73,8 +73,8 @@ targets:
         BUNDLE_DISPLAY_NAME: OpenDisplay
         # The fork's version: the upstream release it is based on plus a
         # fork suffix. The build number sits above upstream 1.25.0's (178).
-        MARKETING_VERSION: "1.25.0-roc.1"
-        CURRENT_PROJECT_VERSION: "179"
+        MARKETING_VERSION: "1.25.0-roc.2"
+        CURRENT_PROJECT_VERSION: "180"
         SWIFT_OBJC_BRIDGING_HEADER: Mac/OpenSidecarMac-Bridging-Header.h
         ENABLE_HARDENED_RUNTIME: YES
         CODE_SIGN_ENTITLEMENTS: Mac/OpenSidecarMac.entitlements

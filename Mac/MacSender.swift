@@ -171,7 +171,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     // Session created after the receiver went to sleep: it refuses
     // connections until its screen is back, so dial failures mean "asleep",
     // not "app closed" — surface that instead of the usual hints. Cleared by
-    // the first successful connection.
+    // the first successful connection, or by the receiver advertising again.
     private var awaitingWake: Bool
 
     // A capture that keeps dying is not coming back on its own (capture
@@ -1386,6 +1386,16 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         }
     }
 
+    /// The receiver advertises again. It withdraws its service while its
+    /// screens sleep, so a returning record means it is awake: from here a
+    /// dial that gets nowhere is a path problem, not sleep, and the row
+    /// should say so instead of "asleep".
+    func peerServiceAdvertised() {
+        queue.async { [weak self] in
+            self?.awaitingWake = false
+        }
+    }
+
     func stream(_ stream: SCStream, didStopWithError error: Error) {
         // A retired stream commonly reports its stop after the replacement is
         // already live. It must not tear down that replacement (#203).
@@ -1836,6 +1846,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             guard let self, generation == self.dialGeneration, !self.stopped,
                   self.connection === conn, conn.state != .ready else { return }
             Log.info("dial timed out in \(conn.state) — redialing")
+            self.reportCableDialTrouble()
             self.scheduleReconnect()
         }
         conn.stateUpdateHandler = { [weak self] state in
@@ -1848,6 +1859,8 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 self.connectionReady = false
                 if case .posix(let code) = error, code == .ECONNREFUSED {
                     self.dialRefused()
+                } else {
+                    self.reportCableDialTrouble()
                 }
                 // Dial-phase state: this connection never carried the
                 // session, so its failure says nothing about a cable —
@@ -1861,10 +1874,12 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 self.connectionReady = false
                 // Read the queue-confined flag here (handler runs on queue),
                 // not inside the detached status Task.
-                let text = self.awaitingWake
-                    ? "\(self.endpointName) is asleep — reconnects when it wakes…"
-                    : "Waiting for receiver at \(self.endpointName)…"
-                Task { await self.status(text) }
+                if !self.reportCableDialTrouble() {
+                    let text = self.awaitingWake
+                        ? "\(self.endpointName) is asleep — reconnects when it wakes…"
+                        : "Waiting for receiver at \(self.endpointName)…"
+                    Task { await self.status(text) }
+                }
                 self.scheduleReconnect()
             case .cancelled:
                 self.connectionReady = false
@@ -1873,6 +1888,25 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             }
         }
         conn.start(queue: queue)
+    }
+
+    /// The direct-cable interface this dial is scoped to (Cable connection
+    /// method), nil for every other dial.
+    private var pinnedCableInterface: String? {
+        guard case .tcp(.service(_, _, _, let interface?)) = transport,
+              DirectCable.isDirectLink(interface) else { return nil }
+        return interface.name
+    }
+
+    /// A dial pinned to the cable got nowhere: say why on the row instead
+    /// of leaving it on "Waiting…" while the redials go on. An asleep
+    /// receiver keeps its own text. On `queue`; true when it reported.
+    @discardableResult
+    private func reportCableDialTrouble() -> Bool {
+        guard !awaitingWake, let name = pinnedCableInterface else { return false }
+        let text = CableDialTrouble.hint(interface: name, tunnel: CableDialTrouble.linkLocalTunnel())
+        Task { await status(text) }
+        return true
     }
 
     /// Dial through macOS's built-in usbmuxd — no external tunnel needed.
